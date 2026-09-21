@@ -41,6 +41,35 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+const auth = require('./middleware/auth');
+const Message = require('./models/Message');
+const Conversation = require('./models/Conversation');
+const User = require('./models/User');
+
+app.get('/api/debug/all', auth, async (req, res) => {
+  try {
+    const totalUsers = await User.countDocuments();
+    const allConversations = await Conversation.countDocuments();
+    const allMessages = await Message.countDocuments();
+    const myConversations = await Conversation.countDocuments({ userId: req.userId });
+    const myMessages = await Message.countDocuments({ userId: req.userId });
+    const recentConversations = await Conversation.find().sort({ createdAt: -1 }).limit(5).populate('contactId', 'name phoneNumber');
+    const recentMessages = await Message.find().sort({ createdAt: -1 }).limit(10);
+    res.json({
+      totalUsers,
+      allConversations,
+      allMessages,
+      myConversations,
+      myMessages,
+      myUserId: req.userId.toString(),
+      recentConversations,
+      recentMessages,
+    });
+  } catch (error) {
+    res.json({ error: error.message });
+  }
+});
+
 app.use(errorHandler);
 
 module.exports = app;
