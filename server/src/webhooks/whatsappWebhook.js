@@ -4,6 +4,8 @@ const Conversation = require('../models/Conversation');
 const Message = require('../models/Message');
 const Contact = require('../models/Contact');
 const User = require('../models/User');
+const aiService = require('../services/aiService');
+const whatsappService = require('../services/whatsappService');
 
 exports.verify = (req, res) => {
   const mode = req.query['hub.mode'];
@@ -159,6 +161,38 @@ async function handleIncomingMessage(msg, contacts, phoneNumberId) {
     await conversation.save();
 
     logger.info('Incoming message stored successfully', { from, messageId: msg.id, userId: user._id, text: textContent.substring(0, 50) });
+
+    // Auto-reply if AI is enabled on this conversation
+    if (conversation.aiEnabled && msg.type === 'text') {
+      try {
+        const recentMessages = await Message.find({ conversationId: conversation._id })
+          .sort({ timestamp: -1 })
+          .limit(10)
+          .lean();
+
+        const history = recentMessages.reverse();
+        const aiReply = await aiService.generateResponse(history, textContent, {});
+
+        await whatsappService.sendTextMessage(from, aiReply.text);
+
+        await Message.create({
+          conversationId: conversation._id,
+          contactId: contact?._id,
+          userId: user._id,
+          direction: 'outgoing',
+          messageType: 'text',
+          text: aiReply.text,
+          status: 'sent',
+        });
+
+        conversation.lastMessageAt = new Date();
+        await conversation.save();
+
+        logger.info('Auto-reply sent', { to: from, reply: aiReply.text.substring(0, 50) });
+      } catch (replyError) {
+        logger.error('Auto-reply failed', { error: replyError.message });
+      }
+    }
   } catch (error) {
     logger.error('Error handling incoming message', { error: error.message, stack: error.stack });
   }
