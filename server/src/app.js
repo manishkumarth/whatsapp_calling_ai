@@ -41,6 +41,28 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+const webhookStats = require('./webhooks/whatsappWebhook');
+app.get('/api/debug/webhook-stats', (req, res) => {
+  res.json(webhookStats.getStats());
+});
+
+app.get('/api/debug/db', async (req, res) => {
+  try {
+    const Message = require('./models/Message');
+    const Conversation = require('./models/Conversation');
+    const User = require('./models/User');
+    const Contact = require('./models/Contact');
+    res.json({
+      users: await User.countDocuments(),
+      conversations: await Conversation.countDocuments(),
+      messages: await Message.countDocuments(),
+      contacts: await Contact.countDocuments(),
+    });
+  } catch (error) {
+    res.json({ error: error.message });
+  }
+});
+
 const auth = require('./middleware/auth');
 const Message = require('./models/Message');
 const Conversation = require('./models/Conversation');

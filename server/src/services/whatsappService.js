@@ -2,7 +2,7 @@ const axios = require('axios');
 const config = require('../config/config');
 const logger = require('../utils/logger');
 
-const GRAPH_API_URL = 'https://graph.facebook.com/v21.0';
+const GRAPH_API_URL = 'https://graph.facebook.com/v25.0';
 
 const getHeaders = () => ({
   Authorization: `Bearer ${config.meta.accessToken}`,

@@ -7,6 +7,12 @@ const User = require('../models/User');
 const aiService = require('../services/aiService');
 const whatsappService = require('../services/whatsappService');
 
+let webhookHitCount = 0;
+let lastWebhookAt = null;
+let lastWebhookError = null;
+
+exports.getStats = () => ({ webhookHitCount, lastWebhookAt, lastWebhookError });
+
 exports.verify = (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -18,37 +24,33 @@ exports.verify = (req, res) => {
     logger.info('Webhook verified successfully');
     return res.status(200).send(challenge);
   }
-  logger.warn('Webhook verification failed', { mode, tokenMatch: token === config.meta.verifyToken });
+  logger.warn('Webhook verification failed', { mode });
   return res.sendStatus(403);
 };
 
 exports.handleEvent = async (req, res) => {
+  webhookHitCount++;
+  lastWebhookAt = new Date().toISOString();
+  res.sendStatus(200);
+
   try {
     const body = req.body;
 
     logger.info('Webhook event received', {
       object: body.object,
       entryCount: body.entry?.length,
-      hasMessages: !!body.entry?.[0]?.changes?.[0]?.value?.messages,
-      hasStatuses: !!body.entry?.[0]?.changes?.[0]?.value?.statuses,
     });
 
-    if (body.object !== 'whatsapp_business_account') {
-      logger.warn('Non-whatsapp_business_account webhook', { object: body.object });
-      return res.sendStatus(404);
-    }
+    if (body.object !== 'whatsapp_business_account') return;
 
     const entry = body.entry?.[0];
     const changes = entry?.changes?.[0];
-    if (!changes) {
-      logger.warn('No changes in webhook entry');
-      return res.sendStatus(200);
-    }
+    if (!changes) return;
 
     const value = changes.value;
     const phoneNumberId = value.metadata?.phone_number_id;
 
-    logger.info('Webhook metadata', { phoneNumberId, wabaId: entry?.id });
+    logger.info('Webhook metadata', { phoneNumberId });
 
     if (value.messages) {
       for (const msg of value.messages) {
@@ -59,15 +61,12 @@ exports.handleEvent = async (req, res) => {
 
     if (value.statuses) {
       for (const status of value.statuses) {
-        logger.info('Processing status update', { id: status.id, status: status.status });
         await handleStatusUpdate(status);
       }
     }
-
-    return res.sendStatus(200);
   } catch (error) {
+    lastWebhookError = { message: error.message, at: new Date().toISOString() };
     logger.error('Webhook processing error', { error: error.message, stack: error.stack });
-    return res.sendStatus(200);
   }
 };
 
@@ -78,22 +77,20 @@ async function handleIncomingMessage(msg, contacts, phoneNumberId) {
     const waId = contactData?.wa_id;
     const contactName = contactData?.profile?.name;
 
-    // Find user who owns this phone_number_id
+    logger.info('Looking up user', { phoneNumberId, from });
+
+    // Find user — try by phoneNumberId first, then fallback to first user
     let user = null;
     if (phoneNumberId) {
       user = await User.findOne({ phoneNumberId });
-      // Fallback: if no user linked by phoneNumberId, find first user and link it
-      if (!user) {
-        user = await User.findOne();
-        if (user && phoneNumberId) {
-          user.phoneNumberId = phoneNumberId;
-          await user.save();
-          logger.info('Auto-linked phoneNumberId to user', { userId: user._id.toString(), phoneNumberId });
-        }
-      }
     }
     if (!user) {
       user = await User.findOne();
+      if (user && phoneNumberId && !user.phoneNumberId) {
+        user.phoneNumberId = phoneNumberId;
+        await user.save();
+        logger.info('Auto-linked phoneNumberId to user', { userId: user._id.toString(), phoneNumberId });
+      }
     }
 
     if (!user) {
@@ -101,17 +98,19 @@ async function handleIncomingMessage(msg, contacts, phoneNumberId) {
       return;
     }
 
+    logger.info('User found', { userId: user._id.toString(), phoneNumberId: user.phoneNumberId });
+
     // Find or create contact
     let contact = null;
     if (waId) {
       contact = await Contact.findOne({ userId: user._id, phoneNumber: `+${waId}` });
-      if (!contact && contactName) {
+      if (!contact) {
         contact = await Contact.create({
           userId: user._id,
-          name: contactName,
+          name: contactName || `+${waId}`,
           phoneNumber: `+${waId}`,
         });
-        logger.info('Auto-created contact from webhook', { name: contactName, phone: waId });
+        logger.info('Auto-created contact', { name: contactName, phone: waId });
       }
     }
 
@@ -125,7 +124,7 @@ async function handleIncomingMessage(msg, contacts, phoneNumberId) {
         channel: 'whatsapp',
         metadata: { phoneNumberId },
       });
-      logger.info('Created new conversation', { from, userId: user._id });
+      logger.info('Created new conversation', { from, userId: user._id.toString() });
     }
 
     // Parse message content
@@ -145,7 +144,8 @@ async function handleIncomingMessage(msg, contacts, phoneNumberId) {
       textContent = msg.interactive?.button_reply?.title || msg.interactive?.list_reply?.title || '[Interactive]';
     }
 
-    await Message.create({
+    // Store incoming message
+    const savedMessage = await Message.create({
       conversationId: conversation._id,
       contactId: contact?._id,
       userId: user._id,
@@ -160,10 +160,10 @@ async function handleIncomingMessage(msg, contacts, phoneNumberId) {
     conversation.lastMessageAt = new Date();
     await conversation.save();
 
-    logger.info('Incoming message stored successfully', { from, messageId: msg.id, userId: user._id, text: textContent.substring(0, 50) });
+    logger.info('Incoming message stored', { from, messageId: msg.id, userId: user._id.toString(), text: textContent.substring(0, 50) });
 
-    // Auto-reply if AI is enabled on this conversation
-    if (conversation.aiEnabled && msg.type === 'text') {
+    // Auto-reply if AI is enabled
+    if (conversation.aiEnabled && msg.type === 'text' && textContent.trim()) {
       try {
         const recentMessages = await Message.find({ conversationId: conversation._id })
           .sort({ timestamp: -1 })
@@ -173,7 +173,9 @@ async function handleIncomingMessage(msg, contacts, phoneNumberId) {
         const history = recentMessages.reverse();
         const aiReply = await aiService.generateResponse(history, textContent, {});
 
-        await whatsappService.sendTextMessage(from, aiReply.text);
+        logger.info('AI reply generated', { reply: aiReply.text.substring(0, 80) });
+
+        const sendResult = await whatsappService.sendTextMessage(from, aiReply.text);
 
         await Message.create({
           conversationId: conversation._id,
@@ -182,15 +184,16 @@ async function handleIncomingMessage(msg, contacts, phoneNumberId) {
           direction: 'outgoing',
           messageType: 'text',
           text: aiReply.text,
+          whatsappMessageId: sendResult.messages?.[0]?.id,
           status: 'sent',
         });
 
         conversation.lastMessageAt = new Date();
         await conversation.save();
 
-        logger.info('Auto-reply sent', { to: from, reply: aiReply.text.substring(0, 50) });
+        logger.info('Auto-reply sent successfully', { to: from });
       } catch (replyError) {
-        logger.error('Auto-reply failed', { error: replyError.message });
+        logger.error('Auto-reply failed', { error: replyError.message, stack: replyError.stack });
       }
     }
   } catch (error) {
@@ -204,9 +207,6 @@ async function handleStatusUpdate(status) {
     if (message) {
       message.status = status.status;
       await message.save();
-      logger.info('Message status updated', { messageId: status.id, status: status.status });
-    } else {
-      logger.warn('Message not found for status update', { whatsappMessageId: status.id });
     }
   } catch (error) {
     logger.error('Error handling status update', { error: error.message });
