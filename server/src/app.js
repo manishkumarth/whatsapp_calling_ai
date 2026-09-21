@@ -17,6 +17,10 @@ const webhookRoutes = require('./routes/webhookRoutes');
 
 const app = express();
 
+if (process.env.NODE_ENV === 'production') {
+  app.set('trust proxy', 1);
+}
+
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors(corsOptions));
 app.use(morgan('combined'));
@@ -35,30 +39,6 @@ app.use('/api/whatsapp', whatsappRoutes);
 
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
-
-const auth = require('./middleware/auth');
-const Message = require('./models/Message');
-const Conversation = require('./models/Conversation');
-
-app.get('/api/debug/messages', auth, async (req, res) => {
-  try {
-    const messages = await Message.find({ userId: req.userId })
-      .sort({ createdAt: -1 })
-      .limit(20)
-      .populate('conversationId', 'phoneNumber');
-    const conversations = await Conversation.find({ userId: req.userId })
-      .sort({ lastMessageAt: -1 })
-      .limit(10);
-    res.json({
-      messageCount: await Message.countDocuments({ userId: req.userId }),
-      conversationCount: await Conversation.countDocuments({ userId: req.userId }),
-      recentMessages: messages,
-      recentConversations: conversations,
-    });
-  } catch (error) {
-    res.json({ error: error.message });
-  }
 });
 
 app.use(errorHandler);
